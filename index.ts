@@ -19,6 +19,18 @@
  * persists in the conversation (KV-cache friendly: not re-analyzed each turn),
  * and the text model can call the `umans_vision` tool for targeted follow-ups.
  *
+ * Two layers cooperate:
+ *   1. `message_end` handoff — transforms images on the message that was just
+ *      finalized (same-turn new images), writing the analysis into history.
+ *   2. `context` hook — the authoritative layer. Fires before EVERY provider
+ *      request and strips any raw image block still present in the replayed
+ *      context. This catches images that entered history under a different
+ *      provider (e.g. a `read` of a PNG under kimi-coding produces a toolResult
+ *      with an image block) which `message_end` never saw, so switching to a
+ *      via-handoff Umans model no longer yields
+ *      `400 This model does not support image inputs`. Analyses are memoized,
+ *      so repeat turns over already-analyzed history cost zero vision calls.
+ *
  * Models and capabilities are fetched live from /v1/models/info on extension
  * load. If the gateway is unreachable, a static fallback catalog is used so the
  * provider still registers.
@@ -360,6 +372,17 @@ export function stripClientWebSearchTool<
 // analysis text still stands, only fresh follow-ups on old images become
 // unavailable until the image is re-attached.
 const imageStore = new Map<string, { data: string; mimeType: string }>();
+
+// Session-scoped cache of image ANALYSIS text keyed by the same content hash.
+// The `context` hook fires before EVERY LLM call, so without this cache a
+// via-handoff model would re-analyze the same historical image on every turn
+// (one extra vision round-trip per image per turn). The `message_end` handoff
+// writes the analysis back into persisted history, but that only covers images
+// created while a via-handoff Umans model was active. Images that entered
+// history under ANOTHER provider (e.g. kimi-coding reading a PNG → toolResult
+// with an image block) are never transformed by message_end, so the context
+// hook is the one that has to handle them — and it must be cheap on repeat.
+const analysisCache = new Map<string, string>();
 
 /**
  * Call a native-vision Umans model with one image + a text prompt and return
@@ -837,10 +860,36 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
+  // Analyze one image, returning the analysis text. Results are memoized in
+  // `analysisCache` by content hash so the `context` hook (which fires before
+  // every LLM call) does not re-run the vision model on the same historical
+  // image turn after turn. Image bytes are also stashed in `imageStore` so the
+  // `umans_vision` tool can re-query the original on demand.
+  async function analyzeAndCache(
+    apiKey: string,
+    model: string,
+    img: { data: string; mimeType: string },
+    ctx: any,
+  ): Promise<{ id: string; text: string }> {
+    const id = hashImageId(img.data);
+    imageStore.set(id, { data: img.data, mimeType: img.mimeType });
+    const cached = analysisCache.get(id);
+    if (cached) return { id, text: cached };
+    let analysis: string;
+    try {
+      analysis = await analyzeImage(apiKey, model, baseUrl, img, VISION_ANALYSIS_PROMPT);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      analysis = `analysis unavailable (${m}); call the umans_vision tool with image id ${id} to retry`;
+    }
+    analysisCache.set(id, analysis);
+    return { id, text: analysis };
+  }
+
   // Returns a copy of `message` with every image block replaced by an
   // `[Image analysis (image:ID)]: ...` text block. Returns undefined when there
-  // are no images to transform. Image bytes are cached in `imageStore` keyed by
-  // a content hash so the `umans_vision` tool can re-query them later.
+  // are no images to transform. Reuses cached analyses so repeat calls (e.g.
+  // from the `context` hook across turns) are free.
   async function transformMessageImages(message: any, apiKey: string, ctx: any) {
     const content = Array.isArray(message.content) ? message.content : null;
     if (!content) return undefined;
@@ -852,36 +901,28 @@ export default async function (pi: ExtensionAPI) {
     if (!visionModelId) return undefined; // nothing to analyze with
     const model = visionModelId;
 
-    setVisionStatus(
-      ctx,
-      `Umans vision: analyzing ${imageIndices.length} image${imageIndices.length > 1 ? "s" : ""}…`,
-    );
+    // Skip the status flash when every image is already cached — this is the
+    // common case in the `context` hook (replay of already-analyzed history),
+    // and a per-turn "analyzing…" banner would be noisy.
+    const allCached = imageIndices.every((i) => analysisCache.has(hashImageId(content[i].data)));
+    if (!allCached) {
+      setVisionStatus(
+        ctx,
+        `Umans vision: analyzing ${imageIndices.length} image${imageIndices.length > 1 ? "s" : ""}…`,
+      );
+    }
     const replacements = new Map<number, { type: "text"; text: string }>();
     await Promise.all(
       imageIndices.map(async (i) => {
         const img = content[i];
-        const id = hashImageId(img.data);
-        imageStore.set(id, { data: img.data, mimeType: img.mimeType });
-        let analysis: string;
-        try {
-          analysis = await analyzeImage(
-            apiKey,
-            model,
-            baseUrl,
-            { data: img.data, mimeType: img.mimeType },
-            VISION_ANALYSIS_PROMPT,
-          );
-        } catch (err) {
-          const m = err instanceof Error ? err.message : String(err);
-          analysis = `analysis unavailable (${m}); call the umans_vision tool with image id ${id} to retry`;
-        }
+        const { id, text } = await analyzeAndCache(apiKey, model, img, ctx);
         replacements.set(i, {
           type: "text",
-          text: `[Image analysis (image:${id})]: ${analysis}`,
+          text: `[Image analysis (image:${id})]: ${text}`,
         });
       }),
     );
-    setVisionStatus(ctx, undefined);
+    if (!allCached) setVisionStatus(ctx, undefined);
     const newContent = content.map((b: any, i: number) => replacements.get(i) ?? b);
     return { ...message, content: newContent };
   }
@@ -987,6 +1028,64 @@ export default async function (pi: ExtensionAPI) {
       }
     });
 
+    // === The authoritative image-stripping layer ===
+    // `message_end` above only fires once, at message creation, and only when a
+    // via-handoff Umans model is already active. Images that entered history
+    // under ANOTHER provider (e.g. kimi-coding reading a PNG → a toolResult
+    // message whose content carries a raw `image` block) are never transformed
+    // by it. When the user later switches to a via-handoff Umans model (e.g.
+    // umans-glm-5.2) and the conversation is replayed, those raw image blocks
+    // reach the gateway verbatim and the gateway rejects them:
+    //   400 {"error":{"type":"invalid_request_error",
+    //         "message":"This model does not support image inputs"}}
+    //
+    // `on("context")` fires before EVERY provider request with a deep copy of
+    // the full message list, so it is the right place to guarantee no raw image
+    // block is ever sent to a via-handoff model — regardless of which provider
+    // created the image or how long ago. Analyses are memoized, so repeat
+    // turns over already-analyzed history cost zero vision round-trips.
+    pi.on("context", async (event, ctx) => {
+      if (visionDisabled) return;
+      if (ctx.model?.provider !== "umans") return;
+      if (!isViaHandoffUmans(ctx.model?.id)) return;
+      if (!visionModelId) return;
+      const messages = event.messages as any[];
+      if (!Array.isArray(messages)) return;
+
+      // Cheap pre-check: any message carrying a raw image block at all?
+      let anyImage = false;
+      for (const m of messages) {
+        if (Array.isArray(m?.content) && m.content.some((b: any) => b?.type === "image")) {
+          anyImage = true;
+          break;
+        }
+      }
+      if (!anyImage) return;
+
+      const apiKey = await resolveApiKey(ctx);
+      if (!apiKey) return; // the request will fail anyway; don't mutate in vain
+      let changed = false;
+      for (let idx = 0; idx < messages.length; idx++) {
+        const m = messages[idx];
+        if (!Array.isArray(m?.content)) continue;
+        if (!m.content.some((b: any) => b?.type === "image")) continue;
+        // Only user / toolResult roles carry image blocks; leave assistant
+        // messages untouched (they are text/toolCall only by construction).
+        if (m.role !== "user" && m.role !== "toolResult") continue;
+        try {
+          const transformed = await transformMessageImages(m, apiKey, ctx);
+          if (transformed) {
+            messages[idx] = transformed;
+            changed = true;
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ctx.ui?.notify?.(`Umans context image handoff failed: ${msg}`, "error");
+        }
+      }
+      if (changed) return { messages };
+    });
+
     // /umans-vision: live control of the client-side handoff (replaces env vars
     // for session-time use; env vars above still seed the initial value).
     pi.registerCommand("umans-vision", {
@@ -1051,6 +1150,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     imageStore.clear();
+    analysisCache.clear();
     const apiKey = await resolveApiKey(ctx);
     if (ctx.model?.provider === "umans") {
       if (apiKey) await refreshUsage(apiKey);
@@ -1138,6 +1238,7 @@ export default async function (pi: ExtensionAPI) {
     liveRequest = undefined;
     lastMetrics = {};
     imageStore.clear();
+    analysisCache.clear();
     setWidget(ctx, undefined);
   });
 
