@@ -238,33 +238,62 @@ function toInputModalities(info: UmansModelInfo): ("text" | "image")[] {
 }
 
 /**
- * Map pi thinking levels to Umans reasoning levels.
+ * Map pi thinking levels to Umans reasoning effort levels.
  *
- * Umans exposes levels: none, minimal, low, medium, high, xhigh, max.
- * Pi exposes levels: off, minimal, low, medium, high, xhigh.
- * Pi has no "max" level, so pi's xhigh is mapped to Umans's max when available,
- * giving users access to the deepest reasoning tier via pi's highest level.
- * When a model cannot disable reasoning (can_disable === false), mark the
- * "off" level as unsupported (null) so pi clamps to the minimum level instead
- * of sending a disabled-thinking parameter the model rejects.
+ * Umans exposes effort levels: none, minimal, low, medium, high, xhigh, max.
+ * Pi 0.82+ exposes levels: off, minimal, low, medium, high, xhigh, max.
+ *
+ * The Umans gateway's /v1/models/info advertises a per-model `reasoning.levels`
+ * array, but in practice it is unreliable as a capability gate:
+ *   - kimi-k2.7 / umans-coder return `levels: []` (empty) yet empirically
+ *     accept and respond to effort = none|low|medium|high|max. The empty list
+ *     means "the model picks its own depth, discrete options are not exposed",
+ *     NOT "reasoning levels are unsupported". Mapping every level to null
+ *     here makes getSupportedThinkingLevels() return [] and the UI offers no
+ *     thinking levels at all — which is the bug this fixes.
+ *   - can_disable === false models (kimi-k2.7, umans-coder) always emit a
+ *     thinking block regardless of the request; sending effort "none" still
+ *     returns thinking. We still expose "off" → null for those so pi clamps
+ *     to the minimum rather than sending a disabled-thinking param.
+ *
+ * Strategy: when the gateway advertises a concrete `levels` list, honor it
+ * exactly (glm-5.2, flash). When `levels` is empty but reasoning is
+ * supported, fall back to a sensible default set derived from `can_disable`,
+ * since the gateway empirically accepts the standard effort ladder.
  */
 function toThinkingLevelMap(
   info: UmansModelInfo,
-): Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string | null>> {
+): Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string | null>> {
   const reasoning = info.capabilities?.reasoning;
   if (!reasoning?.supported) return {};
 
-  const levels = new Set(reasoning.levels);
+  const advertised = reasoning.levels ?? [];
+  const hasLevels = advertised.length > 0;
+  const levels = new Set(advertised);
+
+  // When the gateway refuses to expose discrete levels (kimi-k2.7, umans-coder),
+  // fall back to the standard effort ladder the gateway empirically accepts.
+  // can_disable gates whether "off" is offered.
+  const fallback = new Set<string>(
+    reasoning.can_disable
+      ? ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+      : ["minimal", "low", "medium", "high", "xhigh", "max"],
+  );
+  const supported = (lvl: string) => (hasLevels ? levels.has(lvl) : fallback.has(lvl));
+
   const map: Partial<
-    Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string | null>
+    Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string | null>
   > = {};
 
-  map.off = reasoning.can_disable && levels.has("none") ? "none" : null;
-  map.minimal = levels.has("minimal") ? "minimal" : null;
-  map.low = levels.has("low") ? "low" : null;
-  map.medium = levels.has("medium") ? "medium" : null;
-  map.high = levels.has("high") ? "high" : null;
-  map.xhigh = levels.has("max") ? "max" : levels.has("xhigh") ? "xhigh" : null;
+  map.off = reasoning.can_disable && supported("none") ? "none" : null;
+  map.minimal = supported("minimal") ? "minimal" : null;
+  map.low = supported("low") ? "low" : null;
+  map.medium = supported("medium") ? "medium" : null;
+  map.high = supported("high") ? "high" : null;
+  map.xhigh = supported("xhigh") ? "xhigh" : null;
+  // Prefer exposing Umans's deepest tier via pi's native "max" level (pi 0.82+)
+  // rather than folding xhigh→max, so the two tiers stay distinguishable.
+  map.max = supported("max") ? "max" : null;
 
   return map;
 }
